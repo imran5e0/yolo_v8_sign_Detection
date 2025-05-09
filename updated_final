@@ -1,0 +1,110 @@
+# main_app.py
+import io
+import os
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from ultralytics import YOLO
+from PIL import Image, UnidentifiedImageError
+import fitz  # PyMuPDF
+import numpy as np
+import cv2
+import pytesseract
+
+# —— CONFIG —— #
+MODEL_PATH   = "yolov8n.pt"
+OUTPUT_DIR   = "signatures"
+CONF_THRESH  = 0.25       # YOLO confidence threshold
+TEXT_CONF    = 60         # Tesseract confidence threshold for text boxes
+DILATE_ITER  = 2          # grow text mask so we remove all ink
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# —— APP & MODEL INIT —— #
+app   = FastAPI(title="Signature Extraction Service")
+model = YOLO(MODEL_PATH)
+
+def pdf_bytes_to_pil(data: bytes):
+    """Convert PDF bytes → list of PIL images via PyMuPDF."""
+    doc = fitz.open(stream=data, filetype="pdf")
+    pages = []
+    for page in doc:
+        mat = fitz.Matrix(2,2)  # 2× resolution
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pages.append(img)
+    return pages
+
+def mask_printed_text(pil_img: Image.Image) -> Image.Image:
+    """Detect text with pytesseract, mask it out, return a PIL image with text erased."""
+    # to CV2 BGR
+    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # run Tesseract layout analysis
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+    mask = np.zeros_like(gray, dtype=np.uint8)
+
+    n = len(data["text"])
+    for i in range(n):
+        conf = int(data["conf"][i])
+        if conf > TEXT_CONF and data["text"][i].strip():
+            x, y, w, h = (data["left"][i], data["top"][i],
+                          data["width"][i], data["height"][i])
+            cv2.rectangle(mask, (x,y), (x+w, y+h), 255, -1)
+
+    # dilate so we cover any residual ink
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+    mask = cv2.dilate(mask, kern, iterations=DILATE_ITER)
+
+    # invert mask: 255 = keep original, 0 = text region
+    inv = cv2.bitwise_not(mask)
+    cleaned = cv2.bitwise_and(img, img, mask=inv)
+
+    # back to PIL RGB
+    return Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB))
+
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    data = await file.read()
+    # 1) try image
+    try:
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        pages = [pil]
+    except UnidentifiedImageError:
+        # 2) try PDF
+        try:
+            pages = pdf_bytes_to_pil(data)
+        except Exception as e:
+            raise HTTPException(400, f"Failed to parse PDF: {e}")
+
+    detections = []
+    for page_idx, page in enumerate(pages, start=1):
+        # mask out printed text
+        masked = mask_printed_text(page)
+
+        # YOLO inference
+        res = model(masked, conf=CONF_THRESH)[0]
+        for det_idx, box in enumerate(res.boxes):
+            cls_id = int(box.cls.cpu())
+            name   = model.names.get(cls_id, str(cls_id))
+            if name != "signature":
+                continue
+
+            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+            crop = page.crop((x1, y1, x2, y2))
+
+            # unique filenames
+            base = f"page{page_idx}_sig{det_idx}"
+            png = os.path.join(OUTPUT_DIR, base + ".png")
+            jpg = os.path.join(OUTPUT_DIR, base + ".jpg")
+
+            crop.save(png)
+            crop.save(jpg, quality=95)
+
+            detections.append({
+                "page": page_idx,
+                "box":  [x1, y1, x2, y2],
+                "png":  png,
+                "jpg":  jpg
+            })
+
+    return JSONResponse({"signatures": detections})
