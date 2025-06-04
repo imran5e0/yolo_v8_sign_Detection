@@ -1,0 +1,1 @@
+https://huggingface.co/tech4humans/yolov8s-signature-detector
